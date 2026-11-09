@@ -1,0 +1,282 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens.
+ *
+ * The whole app is one lit cinema screen in a dark room, so the palette is
+ * light rather than paint: an unlit room, projected white, and the colour of
+ * whatever card is on the screen. There is no separate accent colour.
+ */
+@theme inline {
+  --font-sans: var(--font-archivo), ui-sans-serif, system-ui, sans-serif;
+
+  --color-room: #000;
+  --color-light: #fff;
+  --color-haze: rgb(255 255 255 / 0.64); /* secondary text */
+  --color-dust: rgb(255 255 255 / 0.18); /* outlines, idle tracks */
+
+  --ease-settle: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    background: var(--color-room);
+  }
+
+  body {
+    min-height: 100svh;
+    background: var(--color-room);
+    color: var(--color-light);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-light);
+    outline-offset: 4px;
+  }
+}
+
+@layer components {
+  /*
+   * Screen tones: the field a title card is lit in. Each is deep enough that
+   * white type clears 7:1 contrast on it.
+   */
+  [data-tone="ultramarine"] { --screen: #1a2bb8; }
+  [data-tone="crimson"]     { --screen: #a3122c; }
+  [data-tone="emerald"]     { --screen: #0b5f4b; }
+  [data-tone="aubergine"]   { --screen: #4b1a6b; }
+  [data-tone="rust"]        { --screen: #94380f; }
+  [data-tone="petrol"]      { --screen: #0b4f5f; }
+
+  /*
+   * The room's width. On wide viewports the screen is as large as it can be
+   * while the bar, the screen and the controls under it still fit without
+   * scrolling: 16.5rem is the height of everything except the screen, 2.39 is
+   * the screen's aspect ratio, and 4rem is the room's side padding.
+   */
+  .room {
+    max-width: 100rem;
+  }
+
+  @media (min-width: 64rem) {
+    .room {
+      max-width: min(100rem, max(44rem, calc((100svh - 16.5rem) * 2.39 + 4rem)));
+    }
+  }
+
+  /* ---- The stage: the screen plus the light it throws into the room ---- */
+
+  .stage {
+    position: relative;
+    isolation: isolate;
+    animation: lamp-on 900ms linear both;
+  }
+
+  .stage::before,
+  .stage::after {
+    content: "";
+    position: absolute;
+    z-index: -1;
+    pointer-events: none;
+  }
+
+  /* Whatever follows the stage stands in its light, not underneath it. */
+  .stage ~ * {
+    position: relative;
+  }
+
+  /* Glow around the screen. */
+  .stage::before {
+    inset: 2% 4%;
+    background: var(--screen);
+    filter: blur(72px);
+    opacity: 0.6;
+  }
+
+  /* Light spilling onto the floor in front of it. */
+  .stage::after {
+    inset: 100% 8% auto;
+    height: 46%;
+    background: linear-gradient(to bottom, var(--screen), transparent 80%);
+    filter: blur(44px);
+    opacity: 0.42;
+  }
+
+  /* ---- The screen itself ---- */
+
+  .screen {
+    position: relative;
+    display: grid;
+    overflow: hidden;
+    /* Children size their type and margins from the screen, not the viewport. */
+    container-type: inline-size;
+    aspect-ratio: 4 / 5;
+    background:
+      /* projector hot spot */
+      radial-gradient(90% 120% at 50% 40%, rgb(255 255 255 / 0.12), transparent 62%),
+      /* falloff toward the edges */
+      radial-gradient(120% 120% at 50% 50%, transparent 58%, rgb(0 0 0 / 0.38)),
+      var(--screen);
+  }
+
+  @media (min-width: 40rem) {
+    .screen { aspect-ratio: 16 / 9; }
+  }
+
+  @media (min-width: 64rem) {
+    .screen { aspect-ratio: 2.39 / 1; } /* anamorphic widescreen */
+  }
+
+  /* Film grain, so the field reads as projected light and not a flat fill. */
+  .screen::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 0 0 0 1'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E");
+    mix-blend-mode: overlay;
+    opacity: 0.32;
+  }
+
+  /* Title-safe area: nothing sits closer to the edge than this. */
+  .screen-safe {
+    position: relative;
+    display: grid;
+    grid-template-rows: 1fr auto;
+    justify-items: center;
+    gap: 4cqi;
+    padding: 9cqi 7cqi 7cqi;
+    text-align: center;
+  }
+
+  .screen-title {
+    align-self: center;
+    width: 100%;
+  }
+
+  /* The lower third. Room for three lines is reserved so the layout holds
+     still while a fact loads. */
+  .screen-subtitle {
+    display: grid;
+    align-items: end;
+    justify-items: center;
+    width: 100%;
+    font-size: clamp(1rem, 1.85cqi, 1.5rem);
+    line-height: 1.42;
+    min-height: calc(3 * 1.42em);
+  }
+
+  /* ---- Type ---- */
+
+  /*
+   * Title card: Archivo at its widest setting, light, in tracked capitals.
+   * `data-size` steps the size down as the title gets longer, so anything up
+   * to the 100-character limit fits the card.
+   */
+  .title-card {
+    font-stretch: 125%;
+    font-weight: 300;
+    line-height: 1.14;
+    letter-spacing: 0.16em;
+    /* Tracking adds space after the last letter of each line; this re-centres it. */
+    padding-left: 0.16em;
+    text-transform: uppercase;
+    text-wrap: balance;
+    overflow-wrap: anywhere;
+    animation: settle 1000ms var(--ease-settle) 200ms both;
+  }
+
+  .title-card[data-size="s"]  { font-size: clamp(1.75rem, 7.2cqi, 7rem); }
+  .title-card[data-size="m"]  { font-size: clamp(1.5rem, 5cqi, 4.75rem); }
+  .title-card[data-size="l"]  { font-size: clamp(1.25rem, 3.4cqi, 3.25rem); font-weight: 350; }
+  .title-card[data-size="xl"] { font-size: clamp(1.05rem, 2.4cqi, 2.3rem); font-weight: 400; }
+
+  /* The same setting as a text field, for typing a title onto the card. */
+  textarea.title-card {
+    display: block;
+    width: 100%;
+    resize: none;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    text-align: center;
+    caret-color: var(--color-light);
+    field-sizing: content;
+  }
+
+  textarea.title-card::placeholder {
+    color: rgb(255 255 255 / 0.42);
+  }
+
+  /* The caret is the focus indicator here; an outline would box the title. */
+  textarea.title-card:focus-visible {
+    outline: none;
+  }
+
+  /* Subtitles carry a dark edge so they hold on any field. */
+  .subtitle {
+    max-width: 44ch;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    text-wrap: balance;
+    text-shadow:
+      0 1px 2px rgb(0 0 0 / 0.55),
+      0 0 12px rgb(0 0 0 / 0.35);
+  }
+
+  /* A subtitle cue cuts in; it does not slide. */
+  .cue {
+    animation: cue 160ms linear both;
+  }
+
+  /* ---- The reel: how much of the 60-second window has run ---- */
+
+  .reel {
+    position: absolute;
+    inset: auto 0 0;
+    height: 3px;
+    background: var(--color-dust);
+  }
+
+  .reel-fill {
+    height: 100%;
+    background: var(--color-light);
+    transform-origin: left;
+    /* --reel-from and --reel-remaining come from the server's freshForMs. */
+    animation: reel-run var(--reel-remaining) linear both;
+  }
+
+  /* ---- Motion ---- */
+
+  @keyframes lamp-on {
+    0%        { opacity: 0; }
+    14%       { opacity: 0.9; }
+    20%       { opacity: 0.4; }
+    34%, 100% { opacity: 1; }
+  }
+
+  @keyframes settle {
+    from { opacity: 0; transform: scale(1.05); filter: blur(8px); }
+    to   { opacity: 1; transform: none; filter: none; }
+  }
+
+  @keyframes cue {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+
+  @keyframes reel-run {
+    from { transform: scaleX(var(--reel-from)); }
+    to   { transform: scaleX(1); }
+  }
+
+  /* The reel is information, so it keeps running; the flourishes do not. */
+  @media (prefers-reduced-motion: reduce) {
+    .stage,
+    .title-card,
+    .cue {
+      animation: none;
+    }
+  }
+}
