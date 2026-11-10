@@ -1,8 +1,13 @@
 import { afterAll, beforeEach, describe, expect, inject, it, vi } from "vitest";
 import { createDb } from "@/lib/db";
 import { FACT_CACHE_WINDOW_MS } from "@/lib/facts/contract";
-import type { FactGenerator } from "@/lib/facts/generate";
-import { getFact, PREVIOUS_FACTS_LIMIT, type FactDeps } from "@/lib/facts/service";
+import type { FactGenerator, GeneratedFact } from "@/lib/facts/generate";
+import {
+  getFact,
+  PREVIOUS_FACTS_LIMIT,
+  type FactDeps,
+  type FactOutcome,
+} from "@/lib/facts/service";
 
 // Real Postgres (see global-setup.ts), fake clock, fake generator.
 const db = createDb(inject("databaseUrl"));
@@ -31,6 +36,38 @@ function deps(generate: FactGenerator): FactDeps {
       failureCooldownMs: COOLDOWN_MS,
     },
   };
+}
+
+/**
+ * Deps for a request that has to wait on someone else's lease. Polls use the
+ * production interval and each one moves the fake clock forward, so the
+ * waiter's deadline and the lease's expiry are reached for real.
+ */
+function waitingDeps(generate: FactGenerator): FactDeps {
+  const base = deps(generate);
+  return {
+    ...base,
+    timings: { ...base.timings!, pollIntervalMs: 250 },
+    sleep: async (ms) => {
+      nowMs += ms;
+    },
+  };
+}
+
+/** A promise the test resolves by hand, to hold a generator mid-call. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The distinct things a batch of requests received. */
+function textsOf(outcomes: FactOutcome[]) {
+  return new Set(outcomes.map((o) => (o.type === "success" ? o.body.fact.text : o.type)));
 }
 
 function fakeGenerator(text = "A fresh fact.") {
@@ -270,5 +307,170 @@ describe("getFact", () => {
         type: "generation_failed",
       });
     });
+
+    it("gives two users bursting at the same time one generation each", async () => {
+      const alice = await createUser("alice@example.com", "Alien");
+      const bob = await createUser("bob@example.com", "Blade Runner");
+      const generate = vi.fn<FactGenerator>(async (movie) => {
+        await pause(150);
+        return { text: `About ${movie}.`, model: "fake-model" };
+      });
+
+      const [forAlice, forBob] = await Promise.all([
+        Promise.all(Array.from({ length: 10 }, () => getFact(alice.id, deps(generate)))),
+        Promise.all(Array.from({ length: 10 }, () => getFact(bob.id, deps(generate)))),
+      ]);
+
+      expect(generate).toHaveBeenCalledTimes(2);
+      expect(textsOf(forAlice)).toEqual(new Set(["About Alien."]));
+      expect(textsOf(forBob)).toEqual(new Set(["About Blade Runner."]));
+      expect(await db.fact.count()).toBe(2);
+    });
+
+    it("does not let one user's cooldown hold back another user", async () => {
+      const alice = await createUser("alice@example.com", "Alien");
+      const bob = await createUser("bob@example.com", "Alien");
+      await getFact(alice.id, deps(failingGenerator())); // starts Alice's cooldown
+      const generate = fakeGenerator("Bob's fact.");
+
+      const outcome = await getFact(bob.id, deps(generate));
+
+      expect(generate).toHaveBeenCalledOnce();
+      expect(outcome).toMatchObject({ type: "success", body: { status: "fresh" } });
+    });
+  });
+
+  describe("cache key", () => {
+    it("does not serve a fresh fact that belongs to a different movie", async () => {
+      const user = await createUser("a@example.com", "Alien");
+      await createFact(user.id, 1_000, "About the sequel.", "Aliens");
+      const generate = fakeGenerator("About Alien.");
+
+      const outcome = await getFact(user.id, deps(generate));
+
+      expect(generate).toHaveBeenCalledOnce();
+      expect(outcome).toMatchObject({
+        type: "success",
+        body: { status: "fresh", fact: { movie: "Alien", text: "About Alien." } },
+      });
+    });
+  });
+
+  describe("waiting requests", () => {
+    it("give up at the deadline when the holder never finishes, without generating", async () => {
+      const user = await createUser("a@example.com");
+      const older = await createFact(user.id, 5 * 60_000);
+      // Another request holds a live lease and is hung.
+      await db.factLease.create({
+        data: { userId: user.id, token: "hung", expiresAt: new Date(nowMs + 30_000) },
+      });
+      const generate = fakeGenerator();
+
+      const outcome = await getFact(user.id, waitingDeps(generate));
+
+      expect(generate).not.toHaveBeenCalled();
+      expect(outcome).toMatchObject({
+        type: "success",
+        body: { status: "stale", fact: { id: older.id } },
+      });
+      expect(nowMs - T0).toBe(12_000); // waited the deadline and no longer
+      // The waiter left the other request's lease alone.
+      expect(await db.factLease.findUnique({ where: { userId: user.id } })).toMatchObject({
+        token: "hung",
+      });
+    });
+
+    it("stop as soon as the holder's lease runs out, and leave generating to the next request", async () => {
+      const user = await createUser("a@example.com");
+      // The holder crashed: its lease has one second left and nobody will release it.
+      await db.factLease.create({
+        data: { userId: user.id, token: "crashed", expiresAt: new Date(nowMs + 1_000) },
+      });
+      const generate = fakeGenerator();
+
+      const waited = await getFact(user.id, waitingDeps(generate));
+
+      expect(generate).not.toHaveBeenCalled();
+      expect(waited).toEqual({ type: "generation_failed" });
+      expect(nowMs - T0).toBe(1_000);
+
+      // A waiter giving up is not an OpenAI failure, so there is no cooldown:
+      // the very next request takes the expired lease over and generates.
+      const next = await getFact(user.id, deps(generate));
+
+      expect(generate).toHaveBeenCalledOnce();
+      expect(next).toMatchObject({ type: "success", body: { status: "fresh" } });
+    });
+  });
+
+  describe("lease ownership", () => {
+    it("a holder that overran its lease does not release the lease of the request that took over", async () => {
+      const user = await createUser("a@example.com");
+      const first = deferred<GeneratedFact>();
+      const second = deferred<GeneratedFact>();
+      const generate = vi
+        .fn<FactGenerator>()
+        .mockReturnValueOnce(first.promise)
+        .mockReturnValueOnce(second.promise);
+
+      // Request 1 takes the lease and hangs inside the generator.
+      const slow = getFact(user.id, deps(generate));
+      await vi.waitFor(() => expect(generate).toHaveBeenCalledTimes(1));
+
+      // Its lease expires, and request 2 takes it over.
+      nowMs += 30_000;
+      const takeover = getFact(user.id, deps(generate));
+      await vi.waitFor(() => expect(generate).toHaveBeenCalledTimes(2));
+
+      // Request 1 finally finishes. It must not delete request 2's lease.
+      first.resolve({ text: "Late.", model: "fake-model" });
+      await slow;
+      expect(await db.factLease.findUnique({ where: { userId: user.id } })).toMatchObject({
+        expiresAt: new Date(T0 + 60_000),
+      });
+
+      second.resolve({ text: "Second.", model: "fake-model" });
+      await takeover;
+      expect(await db.factLease.count()).toBe(0);
+    });
+
+    it("releases the lease when storing the fact fails", async () => {
+      const user = await createUser("a@example.com");
+      // Postgres refuses a NUL byte in text, so this insert fails for real.
+      const generate = fakeGenerator("bad\u0000text");
+
+      await expect(getFact(user.id, deps(generate))).rejects.toThrow();
+
+      expect(await db.fact.count()).toBe(0);
+      expect(await db.factLease.count()).toBe(0);
+    });
+  });
+
+  describe("under load", () => {
+    it(
+      "costs one generation per window for 50 concurrent requests, five windows in a row",
+      { timeout: 60_000 },
+      async () => {
+        const user = await createUser("a@example.com");
+        let made = 0;
+        const generate = vi.fn<FactGenerator>(async () => {
+          await pause(50);
+          return { text: `Fact ${++made}.`, model: "fake-model" };
+        });
+
+        for (let window = 1; window <= 5; window++) {
+          const outcomes = await Promise.all(
+            Array.from({ length: 50 }, () => getFact(user.id, deps(generate))),
+          );
+
+          expect(generate).toHaveBeenCalledTimes(window);
+          expect(textsOf(outcomes)).toEqual(new Set([`Fact ${window}.`]));
+          nowMs += FACT_CACHE_WINDOW_MS; // the window closes
+        }
+
+        expect(await db.fact.count()).toBe(5);
+        expect(await db.factLease.count()).toBe(0);
+      },
+    );
   });
 });
