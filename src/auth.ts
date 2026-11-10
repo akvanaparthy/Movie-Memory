@@ -3,6 +3,7 @@ import { PrismaAdapter } from "@auth/prisma-adapter";
 import NextAuth from "next-auth";
 import Google from "next-auth/providers/google";
 import { getDb } from "@/lib/db";
+import { toPublicSession } from "@/lib/public-session";
 
 // The config is a function so the database client (and DATABASE_URL) is only
 // needed when a request actually reaches Auth.js, not when this module loads
@@ -17,10 +18,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth(() => ({
   // revokes access immediately (a JWT would stay valid until it expires).
   session: { strategy: "database" },
   callbacks: {
-    // With database sessions the default session omits the user id.
-    session({ session, user }) {
-      session.user.id = user.id;
-      return session;
-    },
+    // The app needs the user id, which the default session omits. Whatever
+    // this returns is also what `/api/auth/session` sends to the browser.
+    session: ({ session, user }) => toPublicSession(session, user),
   },
 }));
