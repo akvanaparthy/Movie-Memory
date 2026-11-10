@@ -18,7 +18,7 @@ npm run dev            # http://localhost:3000
 Tests need no setup at all:
 
 ```bash
-npm test               # boots its own throwaway Postgres, applies the migrations, runs 25 tests
+npm test               # boots its own throwaway Postgres, applies the migrations, runs 95 tests
 ```
 
 Also available: `npm run lint`, `npm run typecheck`, `npm run build`. GitHub Actions runs all four on every push (`.github/workflows/ci.yml`).
@@ -58,12 +58,13 @@ Browser
 | --- | --- |
 | `src/auth.ts` | Auth.js v5: Google provider, Prisma adapter, database sessions. |
 | `src/lib/session.ts` | `getCurrentUser()` / `requireUser()`: the only way pages learn who is signed in. |
+| `src/lib/public-session.ts` | The only session fields that leave the server. |
 | `src/lib/actions.ts` | Server actions: save the movie, sign in, sign out. |
-| `src/lib/movie.ts` | Movie title validation (zod). |
+| `src/lib/movie.ts`, `src/lib/text.ts` | Movie title validation (zod), and the text cleaning it shares with model output. |
 | `src/lib/facts/` | The variant: `service.ts` (the algorithm), `lease.ts` (burst guard), `freshness.ts` (the 60-second rule), `generate.ts` (OpenAI), `timings.ts` (the numbers), `contract.ts` (the API's types, shared with the client). |
 | `src/app/api/fact/route.ts` | `GET /api/fact`: session to user id, outcome to HTTP status. |
 | `src/app/**/page.tsx`, `src/components/` | The three pages and their UI. |
-| `test/` | Vitest: the fact service against real Postgres, the route handler, validation. |
+| `test/` | Vitest: the fact service and the onboarding action against real Postgres, the route handler, the OpenAI call, validation. See [Testing](#testing). |
 
 ### Auth flow
 
@@ -74,7 +75,8 @@ Browser
   - `/onboarding` signed out: redirect to `/`. Movie already saved: redirect to `/dashboard`.
   - `/dashboard` signed out: redirect to `/`. No movie yet: redirect to `/onboarding`.
 - "First-time user" is not a separate flag. It is `User.favoriteMovie IS NULL`, so there is nothing that can drift out of sync with the data.
-- Next 16 enables Cache Components by default, which wants session reads behind a `<Suspense>` boundary. A redirect from inside a streamed boundary is sent as a meta tag after a 200. I wanted real redirects, so the three pages export `instant = false` and render per request: signed-out `GET /dashboard` returns a 307.
+- The redirects are HTTP 307s sent before any HTML. That is why Cache Components, which the Next 16 scaffold turns on, is off here: with it on, a session read always streams behind a `<Suspense>` boundary, so a signed-out `GET /dashboard` answered 200 and redirected in the browser. `next dev` returned a 307 either way; only testing the production build showed the difference.
+- `/api/auth/session` returns the user's id, name, email, photo and the expiry, and nothing else. Auth.js sends whatever the session callback returns, so that object is built field by field (`src/lib/public-session.ts`).
 
 ### Data model
 
@@ -131,15 +133,16 @@ Why this is safe under concurrency:
 - Explicit 10 s timeout and zero retries, because the lease timing depends on a bounded call.
 - The movie title is untrusted input. It is never placed in the instructions; it is passed as delimited data, with angle brackets stripped so it cannot close the delimiter, and the model is told to treat it as a title only.
 - Up to 10 earlier facts for the same user and movie are sent along so the model does not repeat itself. They are delimited and treated as data in the same way as the title.
-- Output is capped at 120 tokens. A reply that did not complete is treated as a failure, so a half sentence is never stored.
+- Output is capped at 120 tokens. A reply that did not complete is treated as a failure, so a half sentence is never stored. Line breaks are flattened and control characters dropped before a fact is stored.
 - Facts are rendered as plain text by React, so model output cannot inject markup.
 
 ### Security and correctness
 
 - **Other users' data:** no endpoint accepts a user id. The route handler does not read the request at all; identity comes only from the session. Every fact query is scoped by `userId`, and tests cover both the fresh and the stale path with two users who share a movie.
-- **Validation:** the movie title is validated on the server (trim, collapse whitespace, 1 to 100 characters). The form's `maxLength` is a convenience.
-- **Server actions** are public endpoints, so `saveFavoriteMovie` re-reads the session and re-validates. Its update only matches rows where the movie is still null, so a replayed submit cannot overwrite.
-- **Responses** from `/api/fact` are `Cache-Control: no-store`. Unexpected errors are logged on the server and returned as a generic message.
+- **Validation:** the movie title is validated on the server: whitespace collapsed, control characters dropped (Postgres cannot store a NUL byte, so one used to turn a submit into a server error), 1 to 100 characters, and at least one visible character, so a title made of zero-width characters is refused. The form's `maxLength` is a convenience.
+- **Server actions** are public endpoints, so `saveFavoriteMovie` re-reads the session and re-validates. Its update only matches rows where the movie is still null, so a replayed submit cannot overwrite. Next.js rejects a cross-site post to it.
+- **Responses** from `/api/fact` are `Cache-Control: no-store`. Unexpected errors, including the database being down during the session lookup, are logged on the server and returned as the same generic JSON 503.
+- **Headers:** every response forbids framing (`frame-ancestors 'none'`, `X-Frame-Options: DENY`) and content sniffing, and limits the referrer.
 - **Missing Google name or photo:** the email stands in for the name and an initial stands in for the photo, including when the photo URL fails to load.
 
 ### Frontend
@@ -162,15 +165,37 @@ The part of this app that can go wrong in production is the OpenAI call: it is s
 
 - **A lease row, not the alternatives.** An in-memory lock breaks with more than one server instance, which is every serverless deployment. A transaction held open across the OpenAI call would pin a pooled connection for seconds per waiting tab. A unique constraint per 60-second bucket gives fixed windows, not a sliding one. The lease costs one small table and one raw SQL statement.
 - **Waiters poll.** Every 250 ms for at most 12 s. `LISTEN/NOTIFY` would be more elegant but does not work through a transaction-mode pooler such as Neon's.
-- **App clock, not database clock.** One injected clock stamps facts and judges their age, which makes the 59 999 / 60 000 ms boundary testable. Across several instances it assumes server clocks agree to well within the 30 s lease.
+- **App clock, not database clock.** One injected clock stamps facts and judges their age, which makes the 59 999 / 60 000 ms boundary testable. Across several instances it assumes server clocks agree to well within the 30 s lease. A fact stamped by a faster clock counts as fresh for at most one full window, never longer.
 - **`GET` with a side effect.** `GET /api/fact` may generate and store a fact. It behaves as a read-through cache and is idempotent within the window, which is what makes refreshes safe.
-- **Blocking pages over streaming.** `instant = false` gives real HTTP redirects at the cost of Next 16's instant static shell. Every page here is per-user, so there was little shell to lose.
+- **Per-request pages over Cache Components.** Turning it off gives real HTTP redirects and simpler pages, at the cost of Next 16's instant static shell. Every page here is per-user, so there was little shell to lose. It is also a choice with an end date: the Next docs say Cache Components becomes the only mode in the next major version, and at that point the signed-out redirect would move into `proxy.ts`.
+- **No script policy.** The headers stop framing and sniffing, but there is no `script-src` Content Security Policy. A strict one needs a per-request nonce, which means `proxy.ts`.
 - **Database sessions over JWT.** Revocable, at the cost of a session lookup per request.
 - **The movie cannot be edited** after onboarding. Inline editing belongs to Variant B. Because of that, `Fact.movie` matching is exact text; an edit flow would need a normalized key.
 - **The failure cooldown is per user and short.** After a failed call, that user's requests skip OpenAI for 15 s and get the fallback at once, instead of each waiting up to 10 s on a call that will fail. It does not stop other users from each making one failing call; a breaker shared across users would. It is short because the UI shows no countdown for it.
 - **Facts are not fact-checked.** The prompt asks for accuracy and for honesty about unknown titles, but nothing verifies what the model writes.
 - **Auth.js v5 is still tagged beta.** It is the version built for the App Router, and I pinned the exact release.
 - **Tests run on an embedded Postgres.** Real SQL semantics with zero setup, at the cost of a binary download on `npm install`.
+
+## Testing
+
+`npm test` runs 95 tests. The fact service and the onboarding action run against real Postgres with a fake clock and a fake OpenAI; the route handler, the OpenAI call and validation are tested on their own. Beyond the cache boundary and the 10-request burst, they cover the cases a hostile or unlucky user would hit: a holder that hangs, crashes or overruns its lease, a failed OpenAI call, a failed database write, a failed session lookup, clock skew between servers, two simultaneous onboarding submits, forged form fields, and titles made of markup, control characters or nothing visible.
+
+The app was also checked by hand against the production build (`next build`, `next start`) with real Postgres and real OpenAI:
+
+- **Cache window in real time:** 17 requests spread across the window made 2 OpenAI calls. A fact was still served at 59 s old and replaced at 60.5 s.
+- **Load:** 300 simultaneous requests for one user with nothing cached produced one OpenAI call, one stored fact and no errors.
+- **Real failure:** with an invalid model name, the first request failed on the real OpenAI error and the next was answered from the cooldown without calling OpenAI.
+- **Red team:** markup in a title is escaped; titles written as prompt injections were not obeyed and leaked no instructions; expired, made-up and SQL-shaped session tokens get a 401; a query string cannot select another user or movie; a sign-out `callbackUrl` pointing at another site is not followed; a cross-site post to the onboarding action is rejected and saves nothing.
+
+That pass found seven defects that the first, all-green test suite had missed. All are fixed. Six now have a regression test; the first needs a running production build, so it was re-checked by hand over HTTP for every signed-in and signed-out combination.
+
+1. In production, a signed-out `GET /dashboard` answered 200 and redirected in the browser. It was a 307 only in `next dev`.
+2. A NUL byte in a movie title became a Postgres error and a 500 on the onboarding submit.
+3. A title made only of zero-width characters was accepted.
+4. `/api/auth/session` returned the whole user row and the raw session token.
+5. With the database down, `/api/fact` answered a bare 500 instead of its documented JSON error.
+6. A fact stamped by a server with a faster clock reported more than 60 s of freshness.
+7. No response carried security headers.
 
 ## With two more hours
 
@@ -179,12 +204,17 @@ The part of this app that can go wrong in production is the OpenAI call: it is s
 3. Show fact history on the dashboard. The facts are already stored.
 4. An edit-movie flow, with a normalized cache key.
 5. An end-to-end test of the sign-in and onboarding redirects against a mocked OAuth provider.
-6. A scheduled cleanup of expired sessions, and structured logs with a request id.
+6. A strict script Content Security Policy with nonces, a scheduled cleanup of expired sessions, and structured logs with a request id.
 
 ## AI usage
 
-- I used Claude Code (Anthropic) throughout, as a pair programmer working from briefs I approved.
-- **Planning:** comparing the two variants and the four burst-protection options in the brief, and settling on the lease design, the schema and the API contract before any code was written.
-- **Current docs:** several libraries changed recently (Next 16 Cache Components and `proxy.ts`, Prisma 7's config and driver adapters, Auth.js v5, the OpenAI Responses API), so the AI read the bundled and official docs instead of relying on memory.
-- **Implementation:** most of the code and all of the tests were written by the AI, the backend and the frontend from separate briefs with a shared contract file between them.
-- **Verification:** the AI ran lint, typecheck, the 25 tests and the production build, checked the signed-out redirects and API statuses over HTTP, and reviewed screenshots of every UI state at desktop and phone widths.
+The code and the tests were written by an AI coding agent (Claude Code). I did not write them by hand. My part was to set the direction, approve each plan before anything changed, test the result, and send work back when it was not good enough.
+
+- **Direction.** I had the agent put a plan to me before writing anything: the variant, the lease design, the schema, the API contract and a visual direction. I changed two things in that plan. I rejected the visual direction and asked for an interface with its own identity, and I asked for hosted Postgres so the app could be deployed.
+- **Approval before changes.** The agent works under a standing rule: present the change, then wait for my go-ahead. Each later round of work, the additions and the fixes below, was proposed first and built only after I approved it.
+- **Holding it to the brief.** Once it worked, I had the agent set out what the brief asked for against what had been built, and justify Variant A against B.
+- **Scope.** I then asked what would make the variant stronger and approved three additions: the failure cooldown, sending earlier facts so they are not repeated, and CI.
+- **My own check.** I created the Google OAuth client, signed in with a real account, went through onboarding, and watched the fact stay the same inside a minute and change after it.
+- **Sending the tests back.** The first suite had 25 passing tests. I judged them too comfortable: happy paths and obvious boundaries. I had the suite rewritten around hostile and unlucky input, asked for a load test and a red-team pass against the production build, and reviewed the tests by hand instead of trusting a green run. That is what found the seven defects listed under [Testing](#testing).
+
+What the AI did beyond writing the code: it read the current docs for libraries that changed recently (Next 16, Prisma 7, Auth.js v5, the OpenAI Responses API) instead of relying on memory, ran lint, typecheck, the tests and the production build, and ran the load and red-team checks above.
