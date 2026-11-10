@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { toSingleLine } from "./text";
 
 // No server-only imports: the onboarding form reads these constants too.
 export const MOVIE_TITLE_MIN = 1;
@@ -6,16 +7,22 @@ export const MOVIE_TITLE_MAX = 100;
 
 const EMPTY_MESSAGE = "Please enter a movie title.";
 
+// At least one letter, digit, punctuation mark or symbol (emoji are symbols).
+// Zero-width characters are not whitespace, so without this a title nobody
+// can see would pass the length check.
+const HAS_SOMETHING_VISIBLE = /[\p{L}\p{N}\p{P}\p{S}]/u;
+
 const movieTitle = z
   .string()
-  // Trim, and collapse runs of whitespace (including tabs and newlines) so
-  // "  The   Matrix " and "The Matrix" are the same title.
-  .transform((raw) => raw.trim().replace(/\s+/g, " "))
+  // "  The   Matrix " and "The Matrix" are the same title, and control
+  // characters never reach the database.
+  .transform(toSingleLine)
   .pipe(
     z
       .string()
       .min(MOVIE_TITLE_MIN, EMPTY_MESSAGE)
-      .max(MOVIE_TITLE_MAX, `Please keep it to ${MOVIE_TITLE_MAX} characters or fewer.`),
+      .max(MOVIE_TITLE_MAX, `Please keep it to ${MOVIE_TITLE_MAX} characters or fewer.`)
+      .regex(HAS_SOMETHING_VISIBLE, EMPTY_MESSAGE),
   );
 
 export type MovieTitleResult = { ok: true; title: string } | { ok: false; error: string };

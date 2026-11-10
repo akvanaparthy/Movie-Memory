@@ -1,6 +1,7 @@
 import "server-only";
 import OpenAI from "openai";
 import { getEnv } from "@/lib/env";
+import { toSingleLine } from "@/lib/text";
 import { OPENAI_TIMEOUT_MS } from "./timings";
 
 export type GeneratedFact = { text: string; model: string };
@@ -73,7 +74,8 @@ export const generateFactWithOpenAI: FactGenerator = async (movie, previousFacts
   if (response.status !== "completed") {
     throw new Error(`OpenAI response not completed: ${response.status}`);
   }
-  const text = response.output_text.trim();
+  // Stored and shown as one line of plain text, like the title.
+  const text = toSingleLine(response.output_text);
   if (!text) throw new Error("OpenAI returned an empty fact");
   return { text, model };
 };
