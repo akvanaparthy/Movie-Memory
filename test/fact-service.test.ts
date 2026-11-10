@@ -2,13 +2,14 @@ import { afterAll, beforeEach, describe, expect, inject, it, vi } from "vitest";
 import { createDb } from "@/lib/db";
 import { FACT_CACHE_WINDOW_MS } from "@/lib/facts/contract";
 import type { FactGenerator } from "@/lib/facts/generate";
-import { getFact, type FactDeps } from "@/lib/facts/service";
+import { getFact, PREVIOUS_FACTS_LIMIT, type FactDeps } from "@/lib/facts/service";
 
 // Real Postgres (see global-setup.ts), fake clock, fake generator.
 const db = createDb(inject("databaseUrl"));
 afterAll(() => db.$disconnect());
 
 const T0 = new Date("2026-01-01T12:00:00.000Z").getTime();
+const COOLDOWN_MS = 15_000;
 let nowMs = T0;
 
 beforeEach(async () => {
@@ -23,7 +24,12 @@ function deps(generate: FactGenerator): FactDeps {
     generate,
     // Short polls keep the tests fast. The clock is frozen, so waiters stop
     // because the lease is released, not because of the deadline.
-    timings: { leaseTtlMs: 30_000, waitDeadlineMs: 12_000, pollIntervalMs: 5 },
+    timings: {
+      leaseTtlMs: 30_000,
+      waitDeadlineMs: 12_000,
+      pollIntervalMs: 5,
+      failureCooldownMs: COOLDOWN_MS,
+    },
   };
 }
 
@@ -78,7 +84,7 @@ describe("getFact", () => {
       const outcome = await getFact(user.id, deps(generate));
 
       expect(generate).toHaveBeenCalledOnce();
-      expect(generate).toHaveBeenCalledWith("Alien");
+      expect(generate).toHaveBeenCalledWith("Alien", ["An older fact."]);
       expect(outcome).toMatchObject({
         type: "success",
         body: { status: "fresh", freshForMs: FACT_CACHE_WINDOW_MS, fact: { text: "Brand new." } },
@@ -159,6 +165,83 @@ describe("getFact", () => {
       expect(generate).toHaveBeenCalledOnce();
       expect(outcome).toMatchObject({ type: "success", body: { status: "fresh" } });
       expect(await db.factLease.count()).toBe(0);
+    });
+  });
+
+  describe("failure cooldown", () => {
+    it("serves the older fact without calling OpenAI again inside the cooldown", async () => {
+      const user = await createUser("a@example.com");
+      const older = await createFact(user.id, 5 * 60_000);
+      const generate = failingGenerator();
+
+      await getFact(user.id, deps(generate));
+      nowMs += COOLDOWN_MS - 1;
+      const outcome = await getFact(user.id, deps(generate));
+
+      expect(generate).toHaveBeenCalledOnce();
+      expect(outcome).toMatchObject({
+        type: "success",
+        body: { status: "stale", freshForMs: 0, fact: { id: older.id } },
+      });
+      expect(await db.factLease.count()).toBe(0);
+    });
+
+    it("reports generation_failed inside the cooldown when there is no older fact", async () => {
+      const user = await createUser("a@example.com");
+      const generate = failingGenerator();
+
+      await getFact(user.id, deps(generate));
+      const outcome = await getFact(user.id, deps(generate));
+
+      expect(generate).toHaveBeenCalledOnce();
+      expect(outcome).toEqual({ type: "generation_failed" });
+    });
+
+    it("calls OpenAI again once the cooldown has passed", async () => {
+      const user = await createUser("a@example.com");
+      const generate = vi
+        .fn<FactGenerator>()
+        .mockRejectedValueOnce(new Error("OpenAI is down"))
+        .mockResolvedValue({ text: "Back up.", model: "fake-model" });
+
+      await getFact(user.id, deps(generate));
+      nowMs += COOLDOWN_MS;
+      const outcome = await getFact(user.id, deps(generate));
+
+      expect(generate).toHaveBeenCalledTimes(2);
+      expect(outcome).toMatchObject({
+        type: "success",
+        body: { status: "fresh", fact: { text: "Back up." } },
+      });
+    });
+  });
+
+  describe("previous facts", () => {
+    it("passes this user's earlier facts for this movie, newest first", async () => {
+      const alice = await createUser("alice@example.com", "Alien");
+      const bob = await createUser("bob@example.com", "Alien");
+      await createFact(alice.id, 3 * 60_000, "Alice, oldest.");
+      await createFact(alice.id, 2 * 60_000, "Alice, newest.");
+      await createFact(alice.id, 1 * 60_000, "Alice, another movie.", "Aliens");
+      await createFact(bob.id, 1 * 60_000, "Bob's fact.");
+      const generate = fakeGenerator();
+
+      await getFact(alice.id, deps(generate));
+
+      expect(generate).toHaveBeenCalledWith("Alien", ["Alice, newest.", "Alice, oldest."]);
+    });
+
+    it(`passes at most ${PREVIOUS_FACTS_LIMIT} earlier facts`, async () => {
+      const user = await createUser("a@example.com");
+      for (let i = 1; i <= PREVIOUS_FACTS_LIMIT + 2; i++) {
+        await createFact(user.id, i * 60_000, `Fact ${i}.`);
+      }
+      const generate = fakeGenerator();
+
+      await getFact(user.id, deps(generate));
+
+      const expected = Array.from({ length: PREVIOUS_FACTS_LIMIT }, (_, i) => `Fact ${i + 1}.`);
+      expect(generate).toHaveBeenCalledWith("Alien", expected);
     });
   });
 

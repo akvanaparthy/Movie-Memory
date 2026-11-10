@@ -24,20 +24,28 @@ export type FactDeps = {
 type FactRow = { id: string; movie: string; text: string; createdAt: Date };
 
 /**
+ * How many earlier facts the generator is shown so it can avoid repeating
+ * them. Enough to cover a long session; bounded so the prompt stays small.
+ */
+export const PREVIOUS_FACTS_LIMIT = 10;
+
+/**
  * Returns a fact for the user's current favorite movie:
  *
  * 1. A fact younger than the cache window is served as `cached`.
- * 2. Otherwise one request per user takes the lease and generates (`fresh`).
- * 3. Concurrent requests wait for that one and get its fact as `cached`, so a
+ * 2. Right after a failed generation, the fallback is served without calling
+ *    OpenAI again until the failure cooldown has passed.
+ * 3. Otherwise one request per user takes the lease and generates (`fresh`).
+ * 4. Concurrent requests wait for that one and get its fact as `cached`, so a
  *    burst costs exactly one OpenAI call, even while OpenAI is failing.
- * 4. If generation fails, the latest older fact is served as `stale`.
+ * 5. If generation fails, the latest older fact is served as `stale`.
  */
 export async function getFact(userId: string, deps: FactDeps): Promise<FactOutcome> {
   const { db, now } = deps;
 
   const user = await db.user.findUnique({
     where: { id: userId },
-    select: { favoriteMovie: true },
+    select: { favoriteMovie: true, factRetryAfter: true },
   });
   const movie = user?.favoriteMovie;
   if (!movie) return { type: "no_movie" };
@@ -45,11 +53,17 @@ export async function getFact(userId: string, deps: FactDeps): Promise<FactOutco
   const latest = await findLatestFact(db, userId, movie);
   if (latest && isFresh(latest.createdAt, now())) return success(latest, "cached", now());
 
+  // A generation failed moments ago: fall back at once instead of taking the
+  // lease and waiting on a call that will most likely fail the same way. This
+  // is per user, so it does not stop other users from each making one failing
+  // call; a circuit breaker shared across users would.
+  if (isCoolingDown(user.factRetryAfter, now())) return fallback(userId, movie, deps);
+
   const timings = deps.timings ?? DEFAULT_TIMINGS;
   const token = randomUUID();
   if (await tryAcquireLease(db, userId, token, now(), timings.leaseTtlMs)) {
     try {
-      return await generateAsHolder(userId, movie, deps);
+      return await generateAsHolder(userId, movie, deps, timings);
     } finally {
       await releaseLease(db, userId, token);
     }
@@ -57,21 +71,43 @@ export async function getFact(userId: string, deps: FactDeps): Promise<FactOutco
   return waitForHolder(userId, movie, deps, timings);
 }
 
-async function generateAsHolder(userId: string, movie: string, deps: FactDeps): Promise<FactOutcome> {
+async function generateAsHolder(
+  userId: string,
+  movie: string,
+  deps: FactDeps,
+  timings: FactTimings,
+): Promise<FactOutcome> {
   const { db, now } = deps;
 
-  // Another request may have finished generating between our first check and
-  // taking the lease.
-  const latest = await findLatestFact(db, userId, movie);
+  // Both checks made before taking the lease are repeated now that we hold it,
+  // because another request may have finished in between: successfully
+  // (leaving a fresh fact) or not (starting a cooldown).
+
+  // One query serves two purposes: the newest row is the freshness re-check,
+  // and all of them are the facts the new one must not repeat.
+  const recent = await findRecentFacts(db, userId, movie, PREVIOUS_FACTS_LIMIT);
+  const latest = recent[0];
   if (latest && isFresh(latest.createdAt, now())) return success(latest, "cached", now());
+
+  const user = await db.user.findUnique({
+    where: { id: userId },
+    select: { factRetryAfter: true },
+  });
+  if (isCoolingDown(user?.factRetryAfter, now())) return fallback(userId, movie, deps);
 
   // Deliberately outside any transaction: holding a DB transaction open for a
   // multi-second network call would pin a pooled connection for no benefit.
   let generated;
   try {
-    generated = await deps.generate(movie);
+    generated = await deps.generate(movie, recent.map((fact) => fact.text));
   } catch (error) {
     console.error("Fact generation failed", { userId, error });
+    // Start the cooldown (app clock, like everything else). Nothing clears it
+    // on success: once this time has passed it is simply ignored.
+    await db.user.update({
+      where: { id: userId },
+      data: { factRetryAfter: new Date(now().getTime() + timings.failureCooldownMs) },
+    });
     return fallback(userId, movie, deps);
   }
 
@@ -106,9 +142,9 @@ async function waitForHolder(
 }
 
 /**
- * The failure path, shared by a failed holder and by waiters that gave up.
- * It checks freshness once more because a waiter can see the lease released
- * just after the holder wrote its fact.
+ * The failure path, shared by a failed holder, by waiters that gave up, and by
+ * requests inside the failure cooldown. It checks freshness once more because
+ * a waiter can see the lease released just after the holder wrote its fact.
  */
 async function fallback(userId: string, movie: string, deps: FactDeps): Promise<FactOutcome> {
   const latest = await findLatestFact(deps.db, userId, movie);
@@ -125,6 +161,21 @@ function findLatestFact(db: Db, userId: string, movie: string): Promise<FactRow 
   return db.fact.findFirst({
     where: { userId, movie },
     orderBy: { createdAt: "desc" },
+    select: factSelect,
+  });
+}
+
+/** True while the cooldown that follows a failed generation is still running. */
+function isCoolingDown(retryAfter: Date | null | undefined, now: Date): boolean {
+  return retryAfter != null && retryAfter > now;
+}
+
+/** Newest first, same scoping as findLatestFact; served by the same index. */
+function findRecentFacts(db: Db, userId: string, movie: string, take: number): Promise<FactRow[]> {
+  return db.fact.findMany({
+    where: { userId, movie },
+    orderBy: { createdAt: "desc" },
+    take,
     select: factSelect,
   });
 }

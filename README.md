@@ -18,10 +18,10 @@ npm run dev            # http://localhost:3000
 Tests need no setup at all:
 
 ```bash
-npm test               # boots its own throwaway Postgres, applies the migration, runs 20 tests
+npm test               # boots its own throwaway Postgres, applies the migrations, runs 25 tests
 ```
 
-Also available: `npm run lint`, `npm run typecheck`, `npm run build`.
+Also available: `npm run lint`, `npm run typecheck`, `npm run build`. GitHub Actions runs all four on every push (`.github/workflows/ci.yml`).
 
 ## Environment variables
 
@@ -37,9 +37,9 @@ Also available: `npm run lint`, `npm run typecheck`, `npm run build`.
 
 ## Database migrations
 
-- `npm run db:migrate` runs `prisma migrate deploy`, which applies everything in `prisma/migrations` (currently one migration, `20261109000000_init`).
+- `npm run db:migrate` runs `prisma migrate deploy`, which applies everything in `prisma/migrations` (currently two: `20261109000000_init` and `20261109010000_fact_retry_after`).
 - To change the schema: edit `prisma/schema.prisma`, then `npx prisma migrate dev --name <what-changed>`.
-- The test suite applies the same migration with the same command to an empty database on every run, so the migration itself is tested.
+- The test suite applies the same migrations with the same command to an empty database on every run, so the migrations themselves are tested.
 
 ## Architecture
 
@@ -79,12 +79,13 @@ Browser
 ### Data model
 
 ```
-User       id, name?, email, image?, favoriteMovie?            (+ Auth.js Account, Session)
-Fact       id, userId → User, movie, text, model, createdAt    index (userId, movie, createdAt DESC)
+User       id, name?, email, image?, favoriteMovie?, factRetryAfter?   (+ Auth.js Account, Session)
+Fact       id, userId → User, movie, text, model, createdAt            index (userId, movie, createdAt DESC)
 FactLease  userId (PK) → User, token, expiresAt
 ```
 
 - `favoriteMovie` is a nullable column on `User`: one user has one favorite, and null carries the onboarding state.
+- `factRetryAfter` is the failure cooldown: after a failed generation, no OpenAI call is made for that user before this time.
 - `Fact.movie` is a snapshot of the title the fact was written for. Facts stay truthful if the favorite ever changes, and "latest fact for this user and movie" is a single index lookup.
 - I did not add a `Movie` table. Titles are free text with no catalog behind them, so a table would add a join without adding integrity.
 - `Fact.createdAt` has no database default. The app clock writes it and the same clock judges its age.
@@ -96,7 +97,8 @@ FactLease  userId (PK) → User, token, expiresAt
 
 1. Load the user's movie. None: `NO_MOVIE`.
 2. Find the latest fact for this user and movie. Under 60 seconds old: return it as `cached`. At exactly 60 000 ms it is no longer fresh.
-3. Otherwise try to take the user's lease with one atomic statement:
+3. If a generation failed for this user in the last 15 seconds (`User.factRetryAfter`), skip OpenAI and go straight to step 7.
+4. Otherwise try to take the user's lease with one atomic statement:
    ```sql
    INSERT INTO "FactLease" (...) VALUES (...)
    ON CONFLICT ("userId") DO UPDATE SET token = ..., "expiresAt" = ...
@@ -104,9 +106,9 @@ FactLease  userId (PK) → User, token, expiresAt
    RETURNING token
    ```
    A row back means the lease is ours (new, or taken over from an expired one). No row means another request is already generating.
-4. **The holder** re-checks for a fresh fact (one may have landed between steps 2 and 3), calls OpenAI outside any transaction, stores the fact and returns it as `fresh`. It releases the lease in `finally`, and only if the token is still its own.
-5. **Everyone else** polls every 250 ms. When the holder's fact appears they return it as `cached`. They never call OpenAI, so ten tabs cost one call, including when that call fails.
-6. **On failure** (timeout, error, empty or truncated reply) return the most recent older fact as `stale`, or `GENERATION_FAILED` if there is none.
+5. **The holder** repeats checks 2 and 3 now that it holds the lease, because another request may have finished in between. It then calls OpenAI outside any transaction, sending the user's last 10 facts for this movie so the new one is not a repeat, stores the fact and returns it as `fresh`. It releases the lease in `finally`, and only if the token is still its own.
+6. **Everyone else** polls every 250 ms. When the holder's fact appears they return it as `cached`. They never call OpenAI, so ten tabs cost one call, including when that call fails.
+7. **On failure** (timeout, error, empty or truncated reply) the holder starts the 15-second cooldown for that user. The response is the most recent older fact as `stale`, or `GENERATION_FAILED` if there is none.
 
 Why this is safe under concurrency:
 
@@ -128,6 +130,7 @@ Why this is safe under concurrency:
 - The key is read in a `server-only` module and never reaches a client bundle. Environment variables are validated lazily, by name, never by value.
 - Explicit 10 s timeout and zero retries, because the lease timing depends on a bounded call.
 - The movie title is untrusted input. It is never placed in the instructions; it is passed as delimited data, with angle brackets stripped so it cannot close the delimiter, and the model is told to treat it as a title only.
+- Up to 10 earlier facts for the same user and movie are sent along so the model does not repeat itself. They are delimited and treated as data in the same way as the title.
 - Output is capped at 120 tokens. A reply that did not complete is treated as a failure, so a half sentence is never stored.
 - Facts are rendered as plain text by React, so model output cannot inject markup.
 
@@ -164,15 +167,15 @@ The part of this app that can go wrong in production is the OpenAI call: it is s
 - **Blocking pages over streaming.** `instant = false` gives real HTTP redirects at the cost of Next 16's instant static shell. Every page here is per-user, so there was little shell to lose.
 - **Database sessions over JWT.** Revocable, at the cost of a session lookup per request.
 - **The movie cannot be edited** after onboarding. Inline editing belongs to Variant B. Because of that, `Fact.movie` matching is exact text; an edit flow would need a normalized key.
-- **No failure backoff.** While OpenAI is down, each new burst makes one attempt and waits up to 10 s for it.
+- **The failure cooldown is per user and short.** After a failed call, that user's requests skip OpenAI for 15 s and get the fallback at once, instead of each waiting up to 10 s on a call that will fail. It does not stop other users from each making one failing call; a breaker shared across users would. It is short because the UI shows no countdown for it.
 - **Facts are not fact-checked.** The prompt asks for accuracy and for honesty about unknown titles, but nothing verifies what the model writes.
 - **Auth.js v5 is still tagged beta.** It is the version built for the App Router, and I pinned the exact release.
 - **Tests run on an embedded Postgres.** Real SQL semantics with zero setup, at the cost of a binary download on `npm install`.
 
 ## With two more hours
 
-1. A short backoff after an OpenAI failure, so an outage serves `stale` immediately instead of retrying on every burst.
-2. Send the user's previous facts with the prompt so a new fact is never a repeat.
+1. A circuit breaker shared across users, so an OpenAI outage costs one failing call in total instead of one per user.
+2. Tell the client when the next attempt is allowed, so "Try again" can show a countdown during the cooldown.
 3. Show fact history on the dashboard. The facts are already stored.
 4. An edit-movie flow, with a normalized cache key.
 5. An end-to-end test of the sign-in and onboarding redirects against a mocked OAuth provider.
@@ -184,4 +187,4 @@ The part of this app that can go wrong in production is the OpenAI call: it is s
 - **Planning:** comparing the two variants and the four burst-protection options in the brief, and settling on the lease design, the schema and the API contract before any code was written.
 - **Current docs:** several libraries changed recently (Next 16 Cache Components and `proxy.ts`, Prisma 7's config and driver adapters, Auth.js v5, the OpenAI Responses API), so the AI read the bundled and official docs instead of relying on memory.
 - **Implementation:** most of the code and all of the tests were written by the AI, the backend and the frontend from separate briefs with a shared contract file between them.
-- **Verification:** the AI ran lint, typecheck, the 20 tests and the production build, checked the signed-out redirects and API statuses over HTTP, and reviewed screenshots of every UI state at desktop and phone widths.
+- **Verification:** the AI ran lint, typecheck, the 25 tests and the production build, checked the signed-out redirects and API statuses over HTTP, and reviewed screenshots of every UI state at desktop and phone widths.

@@ -25,6 +25,10 @@ model User {
   /// user to onboarding.
   favoriteMovie String?
 
+  /// After a failed generation, no new OpenAI call is made for this user
+  /// before this time. Written by the app clock. See src/lib/facts/timings.ts.
+  factRetryAfter DateTime?
+
   accounts  Account[]
   sessions  Session[]
   facts     Fact[]
