@@ -63,6 +63,36 @@ describe("GET /api/fact", () => {
     expect(((await res.json()) as FactError).error.code).toBe(code);
   });
 
+  it.each([
+    ["an empty session object", {}],
+    ["a session whose user has no id", { user: { email: "a@example.com" } }],
+    ["a session with an empty id", { user: { id: "" } }],
+  ])("returns 401 for %s", async (_label, session) => {
+    auth.mockResolvedValue(session);
+
+    const res = await call(new Request("http://localhost/api/fact"));
+
+    expect(res.status).toBe(401);
+    expect(getFact).not.toHaveBeenCalled();
+  });
+
+  // The session lookup is a database query too. If the database is down it is
+  // the first thing to fail, and the client must still get the documented
+  // JSON error rather than a bare 500.
+  it("answers with the generic 503 when the session lookup itself fails", async () => {
+    auth.mockRejectedValue(new Error("connect ECONNREFUSED 10.0.0.5:5432"));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await call(new Request("http://localhost/api/fact"));
+    const body = (await res.json()) as FactError;
+
+    expect(res.status).toBe(503);
+    expect(body.error.code).toBe("GENERATION_FAILED");
+    expect(JSON.stringify(body)).not.toContain("ECONNREFUSED");
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    expect(getFact).not.toHaveBeenCalled();
+  });
+
   it("hides unexpected errors behind a generic 503", async () => {
     auth.mockResolvedValue({ user: { id: "bob" } });
     getFact.mockRejectedValue(new Error("connect ECONNREFUSED 10.0.0.5:5432"));

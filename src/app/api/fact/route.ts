@@ -7,11 +7,13 @@ import { getFact } from "@/lib/facts/service";
 // Identity comes from the session cookie and nothing else. The request is not
 // even read, so a `?userId=` or a body cannot select another user's facts.
 export async function GET(): Promise<Response> {
-  const session = await auth();
-  const userId = session?.user?.id;
-  if (!userId) return error(401, "UNAUTHENTICATED", "Please sign in to see your movie fact.");
-
   try {
+    // Inside the try: the session lookup is a database query too, and it is
+    // the first thing to fail when the database is down.
+    const session = await auth();
+    const userId = session?.user?.id;
+    if (!userId) return error(401, "UNAUTHENTICATED", "Please sign in to see your movie fact.");
+
     const outcome = await getFact(userId, {
       db: getDb(),
       now: () => new Date(),
