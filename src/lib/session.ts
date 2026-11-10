@@ -1,6 +1,5 @@
 import "server-only";
 import { redirect } from "next/navigation";
-import { connection } from "next/server";
 import { auth } from "@/auth";
 import { getDb } from "@/lib/db";
 
@@ -15,11 +14,6 @@ export type CurrentUser = {
 
 /** The signed-in user, or null when signed out. */
 export async function getCurrentUser(): Promise<CurrentUser | null> {
-  // Auth.js draws random bytes before it reads the request. With Cache
-  // Components, Next.js treats that as an attempt to prerender something
-  // random and reports an error, so say first that this is per-request work.
-  await connection();
-
   const session = await auth();
   const userId = session?.user?.id;
   if (!userId) return null;

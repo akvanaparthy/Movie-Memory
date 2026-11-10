@@ -4,9 +4,7 @@ import { MovieForm } from "@/components/movie-form";
 import { Room, Wordmark } from "@/components/room";
 import { requireUser } from "@/lib/session";
 
-// Session-gated: render per request so the redirects below are real HTTP ones.
-export const instant = false;
-
+// Session-gated and rendered per request: the redirects below are HTTP 307s.
 export default async function OnboardingPage() {
   const user = await requireUser(); // signed out -> "/"
 

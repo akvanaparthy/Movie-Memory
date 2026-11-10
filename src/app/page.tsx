@@ -5,11 +5,9 @@ import { Screen, TitleCard } from "@/components/screen";
 import { BRAND_TONE } from "@/components/tone";
 import { getCurrentUser } from "@/lib/session";
 
-// This page depends on the session, so it renders per request. Blocking here
-// (rather than streaming behind a Suspense boundary) means a signed-in visitor
-// gets a real HTTP redirect before any HTML is sent.
-export const instant = false;
-
+// Reading the session makes this page render per request. There is no
+// Suspense boundary above it, so a signed-in visitor gets a real HTTP
+// redirect before any HTML is sent.
 export default async function LandingPage() {
   const user = await getCurrentUser();
   if (user) {
