@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The job only reads the code; it needs no write access and no secrets.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      # Also runs `prisma generate` (postinstall).
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      # Starts its own embedded Postgres and applies the migrations to it.
+      - run: npm test
+      # Env vars are read lazily at request time, so the build needs none.
+      - run: npm run build
